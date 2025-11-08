@@ -8,10 +8,10 @@ import math
 # Part 1: Download and Save TLE Data
 # -------------------------------
 
-def download_tle_data(url):
+def download_tle_data(url, timeout_seconds=30):
     try:
         print(f"Fetching data from {url}...")
-        response = requests.get(url)
+        response = requests.get(url, timeout=timeout_seconds)
         response.raise_for_status()  # Raise an exception for HTTP errors
         return response.text
     except requests.exceptions.RequestException as e:
@@ -83,33 +83,85 @@ def is_tle_valid(line1):
         print(f"Error parsing TLE line: {line1}, Error: {e}")
         return False
 
-def eci_to_latlonalt(eci_position):
-    EARTH_RADIUS = 6371.0  # in kilometers
-    x, y, z = eci_position
-    lon = math.degrees(math.atan2(y, x))
-    lat = math.degrees(math.atan2(z, math.sqrt(x**2 + y**2)))
-    alt = math.sqrt(x**2 + y**2 + z**2) - EARTH_RADIUS
-    # Normalize longitude to [-180, 180]
-    lon = (lon + 180) % 360 - 180
-    # Return altitude in meters
-    return lat, lon, alt * 1000
+WGS84_A = 6378.137  # Semi-major axis in kilometers
+WGS84_B = 6356.7523142  # Semi-minor axis in kilometers
+WGS84_E2 = 1 - (WGS84_B ** 2) / (WGS84_A ** 2)
+WGS84_EP2 = (WGS84_A ** 2) / (WGS84_B ** 2) - 1
+
+
+def gstime(jdut1):
+    tut1 = (jdut1 - 2451545.0) / 36525.0
+    temp = (-6.2e-6 * tut1**3) + (0.093104 * tut1**2) + ((876600.0 * 3600 + 8640184.812866) * tut1) + 67310.54841
+    temp = (temp % 86400.0) / 240.0  # Convert seconds to degrees
+    gmst = math.radians(temp % 360.0)
+    return gmst
+
+
+def teme_to_ecef(teme_position_km, jd_ut1):
+    gmst = gstime(jd_ut1)
+    cos_gmst = math.cos(gmst)
+    sin_gmst = math.sin(gmst)
+    x_teme, y_teme, z_teme = teme_position_km
+    x_ecef = cos_gmst * x_teme + sin_gmst * y_teme
+    y_ecef = -sin_gmst * x_teme + cos_gmst * y_teme
+    z_ecef = z_teme
+    return x_ecef, y_ecef, z_ecef
+
+
+def ecef_to_geodetic(x_km, y_km, z_km):
+    p = math.sqrt(x_km**2 + y_km**2)
+    if p == 0.0:
+        lon = 0.0
+    else:
+        lon = math.atan2(y_km, x_km)
+
+    theta = math.atan2(z_km * WGS84_A, p * WGS84_B)
+    sin_theta = math.sin(theta)
+    cos_theta = math.cos(theta)
+
+    lat = math.atan2(
+        z_km + WGS84_EP2 * WGS84_B * sin_theta**3,
+        p - WGS84_E2 * WGS84_A * cos_theta**3
+    )
+
+    sin_lat = math.sin(lat)
+    N = WGS84_A / math.sqrt(1 - WGS84_E2 * sin_lat**2)
+    alt_km = (p / math.cos(lat)) - N
+
+    lon_deg = (math.degrees(lon) + 180.0) % 360.0 - 180.0
+    lat_deg = math.degrees(lat)
+    alt_m = alt_km * 1000.0
+    return lat_deg, lon_deg, alt_m
+
+
+def teme_to_latlonalt(position_km, jd, fr):
+    jd_ut1 = jd + fr
+    x_ecef, y_ecef, z_ecef = teme_to_ecef(position_km, jd_ut1)
+    return ecef_to_geodetic(x_ecef, y_ecef, z_ecef)
 
 def is_valid_point(lat, lon):
     return -90 <= lat <= 90 and -180 <= lon <= 180
 
 def fix_idl_crossings(trajectory):
-    fixed_trajectory = []
+    if not trajectory:
+        return []
+
+    fixed = []
+    offset = 0.0
     prev_lon = None
-    for point in trajectory:
-        lon, lat, alt = point
-        if prev_lon is not None and abs(lon - prev_lon) > 180:
-            lon += -360 if lon > prev_lon else 360
-        fixed_trajectory.append([lon, lat, alt])
-        prev_lon = lon
-    # Re-normalize longitudes
-    for point in fixed_trajectory:
-        point[0] = (point[0] + 180) % 360 - 180
-    return fixed_trajectory
+
+    for lon, lat, alt in trajectory:
+        if prev_lon is not None:
+            diff = (lon + offset) - prev_lon
+            if diff > 180.0:
+                offset -= 360.0
+            elif diff < -180.0:
+                offset += 360.0
+        adjusted_lon = lon + offset
+        fixed.append([adjusted_lon, lat, alt])
+        prev_lon = adjusted_lon
+
+    return fixed
 
 def generate_trajectory_with_timestamps(satellite, start_time, duration_hours, time_step_minutes):
     trajectory = []
@@ -123,7 +175,7 @@ def generate_trajectory_with_timestamps(satellite, start_time, duration_hours, t
         error_code, position, velocity = satellite.sgp4(jd, fr)
         
         if error_code == 0:
-            lat, lon, alt = eci_to_latlonalt(position)
+            lat, lon, alt = teme_to_latlonalt(position, jd, fr)
             if is_valid_point(lat, lon):
                 trajectory.append([lon, lat, alt])
                 timestamps.append(current_time.isoformat())
